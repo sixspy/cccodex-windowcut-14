@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user
 from db import connect, write_audit
+from gate_book import assert_frozen
 from locks import release, require_lock
 from models import EventIn
 
@@ -17,6 +18,15 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _add_promotable(conn, late_id: int, biz_key: str, event_ts: str, amount: float) -> None:
+    """迟到入桶同事务写可补入索引；失败由调用方整笔回滚。"""
+    conn.execute(
+        """INSERT INTO late_promotable(late_id,biz_key,event_ts,amount,created_at)
+           VALUES (?,?,?,?,?)""",
+        (late_id, biz_key, event_ts, amount, _now()),
+    )
+
+
 @router.post("/api/events")
 def ingest_event(body: EventIn, authorization: AuthHeader = None):
     user = require_user(authorization)
@@ -24,6 +34,7 @@ def ingest_event(body: EventIn, authorization: AuthHeader = None):
     with connect() as conn:
         require_lock(conn, lock_key, user)
         try:
+            assert_frozen(conn, user, "ingest_late")
             w = conn.execute(
                 "SELECT * FROM windows WHERE name=?", (body.window_name,)
             ).fetchone()
@@ -38,9 +49,9 @@ def ingest_event(body: EventIn, authorization: AuthHeader = None):
                     (None, body.biz_key, ts, body.amount, "迟到桶", created),
                 )
                 eid = cur.lastrowid
-                conn.execute(
-                    """INSERT INTO late_bucket(event_id,window_name,biz_key,event_ts,amount,reason,created_at)
-                       VALUES (?,?,?,?,?,?,?)""",
+                late_cur = conn.execute(
+                    """INSERT INTO late_bucket(event_id,window_name,biz_key,event_ts,amount,reason,created_at,status)
+                       VALUES (?,?,?,?,?,?,?,?)""",
                     (
                         eid,
                         body.window_name,
@@ -49,17 +60,25 @@ def ingest_event(body: EventIn, authorization: AuthHeader = None):
                         body.amount,
                         "关窗后到达",
                         created,
+                        "可补入",
                     ),
+                )
+                _add_promotable(
+                    conn, late_cur.lastrowid, body.biz_key, ts, body.amount
                 )
                 write_audit(
                     conn,
                     user,
                     "ingest_late",
                     body.biz_key,
-                    {"window": body.window_name},
+                    {"window": body.window_name, "late_id": late_cur.lastrowid},
                 )
                 conn.commit()
-                return {"disposition": "迟到桶", "event_id": eid}
+                return {
+                    "disposition": "迟到桶",
+                    "event_id": eid,
+                    "late_id": late_cur.lastrowid,
+                }
 
             if not (w["open_at"] <= ts <= w["close_at"]):
                 conn.execute(
@@ -103,6 +122,11 @@ def ingest_event(body: EventIn, authorization: AuthHeader = None):
             )
             conn.commit()
             return {"disposition": "窗内", "window_id": w["id"], "event_id": cur.lastrowid}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            conn.rollback()
+            raise HTTPException(500, f"入账失败已回滚：{exc}") from exc
         finally:
             release(conn, lock_key, user)
             conn.commit()

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +17,7 @@ PRODUCT_META = {
         "windows",
         "ingest",
         "late_bucket",
+        "late_writeoff_gate",
         "materialize",
         "reconcile",
         "locks",
@@ -23,7 +25,7 @@ PRODUCT_META = {
         "hold_staging",
         "reopen",
     ],
-    "stubs": ["hold_release", "late_promote", "partition_mat", "reopen"],
+    "stubs": ["hold_release", "partition_mat", "reopen"],
 }
 
 
@@ -74,6 +76,27 @@ CREATE TABLE IF NOT EXISTS late_bucket(
   event_ts TEXT NOT NULL,
   amount REAL NOT NULL,
   reason TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT '可补入',
+  written_off_at TEXT,
+  written_off_by TEXT,
+  promoted_event_id INTEGER,
+  promoted_at TEXT
+);
+CREATE TABLE IF NOT EXISTS late_promotable(
+  late_id INTEGER PRIMARY KEY,
+  biz_key TEXT NOT NULL,
+  event_ts TEXT NOT NULL,
+  amount REAL NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(late_id) REFERENCES late_bucket(id)
+);
+CREATE TABLE IF NOT EXISTS writeoff_gate_book(
+  id INTEGER PRIMARY KEY,
+  path TEXT NOT NULL,
+  frozen_on TEXT NOT NULL,
+  locked INTEGER NOT NULL DEFAULT 1,
+  note TEXT,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS materializations(
@@ -250,11 +273,63 @@ def seed_if_empty(conn: sqlite3.Connection) -> None:
     )
 
 
+GATE_BOOK_FROZEN = {
+    "path": "甲",
+    "frozen_on": "2026-11-20",
+    "note": "状态机冻结核销：核销同事务清索引，补入以核销态为前置不变量；禁止票根路径乙，两侧不得混用",
+}
+
+
+def ensure_gate_book(conn: sqlite3.Connection) -> None:
+    """写入冻结口径；已存在则不改口（当天及之后均只读）。"""
+    row = conn.execute("SELECT * FROM writeoff_gate_book WHERE id=1").fetchone()
+    if row is None:
+        conn.execute(
+            """INSERT INTO writeoff_gate_book(id,path,frozen_on,locked,note,created_at)
+               VALUES (1,?,?,1,?,?)""",
+            (
+                GATE_BOOK_FROZEN["path"],
+                GATE_BOOK_FROZEN["frozen_on"],
+                GATE_BOOK_FROZEN["note"],
+                datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+
+
+def migrate_late_bucket(conn: sqlite3.Connection) -> None:
+    """旧库补列 + 可补入索引回填；脏态（已核销仍有索引）就地清理。"""
+    cols = {
+        r["name"]
+        for r in conn.execute("PRAGMA table_info(late_bucket)").fetchall()
+    }
+    for name, ddl in (
+        ("status", "ALTER TABLE late_bucket ADD COLUMN status TEXT NOT NULL DEFAULT '可补入'"),
+        ("written_off_at", "ALTER TABLE late_bucket ADD COLUMN written_off_at TEXT"),
+        ("written_off_by", "ALTER TABLE late_bucket ADD COLUMN written_off_by TEXT"),
+        ("promoted_event_id", "ALTER TABLE late_bucket ADD COLUMN promoted_event_id INTEGER"),
+        ("promoted_at", "ALTER TABLE late_bucket ADD COLUMN promoted_at TEXT"),
+    ):
+        if name not in cols:
+            conn.execute(ddl)
+    conn.execute(
+        """INSERT OR IGNORE INTO late_promotable(late_id,biz_key,event_ts,amount,created_at)
+           SELECT id,biz_key,event_ts,amount,created_at
+           FROM late_bucket WHERE status='可补入'"""
+    )
+    conn.execute(
+        """DELETE FROM late_promotable
+           WHERE late_id IN (SELECT id FROM late_bucket WHERE status!='可补入')"""
+    )
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
         ensure_users(conn)
+        ensure_gate_book(conn)
         seed_if_empty(conn)
+        # 迁移/回填放在种子之后：种子迟到行也要进可补入索引
+        migrate_late_bucket(conn)
         conn.commit()
 
 

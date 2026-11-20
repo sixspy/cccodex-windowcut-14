@@ -25,7 +25,16 @@
 | 业务 LOC | ≥900（目标 1000+） |
 | 后端具名模块 | `db` / `auth` / `locks` / `windows_svc` / `ingest_svc` / `late_svc` / `materialize_svc` / `reconcile_svc` / `audit_svc` / `hold_svc` / `reopen_svc` |
 | 前端视图 | 业务窗 / 入账 / 迟到桶 / 物化 / 对账 / 审计争用 |
-| 空桩 | hold 晋升、迟到补入、分区物化、窗重开 |
+| 空桩 | hold 晋升、分区物化、窗重开 |
+
+## 迟到桶核销门禁（甲路径）
+
+- 口径冻结于 `docs/核销门禁册.md`：**状态机冻结核销**，不走 `void_ticket` 票根。
+- 核销：`POST /api/late-bucket/{late_id}/writeoff`，同事务切「已核销」+ 清可补入索引，失败同回滚。
+- 补入：`POST /api/late-bucket/promote`，先验核销态与索引；核销笔整笔拒补、正式窗零增。
+- 可补入队列：`GET /api/late-bucket/promotable`；五处同态互证：`GET /api/audit/consistency`。
+- 核销与补入共用锁键 `late-bucket:{late_id}`，后到只记争用。
+- 门禁册偏离拒写并记 `gate_deviation`（详情含「门禁偏了」）。
 
 ## 为何能出多题
 

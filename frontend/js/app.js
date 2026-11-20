@@ -24,6 +24,7 @@ createApp({
     const reconAll = ref([]);
     const lateItems = ref([]);
     const lateSummary = ref({});
+    const promotableIds = ref([]);
     const audits = ref([]);
     const contention = ref([]);
     const locks = ref([]);
@@ -94,6 +95,9 @@ createApp({
       const ls = await api.get("/api/late-bucket/summary");
       if (ls === null) return;
       lateSummary.value = ls.body || {};
+      const lp = await api.get("/api/late-bucket/promotable");
+      if (lp === null) return;
+      promotableIds.value = (lp.body.items || []).map((x) => x.late_id);
       const ra = await api.get("/api/reconcile");
       if (ra === null) return;
       reconAll.value = Array.isArray(ra.body.items) ? ra.body.items : [];
@@ -159,12 +163,23 @@ createApp({
     }
 
     async function promoteLate(id) {
+      actionErr.value = "";
       const target =
         (windows.value.find((w) => w.status === "开启") || {}).name || "W-1102";
-      await api.post("/api/late-bucket/promote-stub", {
+      const r = await api.post("/api/late-bucket/promote", {
         late_id: id,
         target_window_name: target,
       });
+      if (r === null) return;
+      actionErr.value = r.ok ? "补入成功" : r.body.detail || "整笔拒补";
+      await refresh();
+    }
+
+    async function writeoffLate(id) {
+      actionErr.value = "";
+      const r = await api.post("/api/late-bucket/" + id + "/writeoff", {});
+      if (r === null) return;
+      actionErr.value = r.ok ? "核销完成" : r.body.detail || "核销失败";
       await refresh();
     }
 
@@ -204,6 +219,7 @@ createApp({
       reconAll,
       lateItems,
       lateSummary,
+      promotableIds,
       audits,
       contention,
       locks,
@@ -223,6 +239,7 @@ createApp({
       loadRecon,
       reopenStub,
       promoteLate,
+      writeoffLate,
       discardLate,
       partitionStub,
       createHold,

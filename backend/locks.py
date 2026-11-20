@@ -47,6 +47,8 @@ def release(conn, lock_key: str, holder: str) -> None:
 
 def require_lock(conn, lock_key: str, holder: str) -> None:
     if not try_acquire(conn, lock_key, holder):
+        # 争用须先落台账：后续抛错会回滚本连接事务，故显式提交
+        conn.commit()
         raise HTTPException(409, "争用：后到只记争用，不写业务")
 
 
